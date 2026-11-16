@@ -1,0 +1,3 @@
+account_id,resource_id,tag_key,tag_value,period_start,period_end
+123456789012,vol-0abc123def4567890,user_cost_center,CC-123,,
+123456789012,i-0123456789abcdef0,user_project,alpha,2026-06,2026-07

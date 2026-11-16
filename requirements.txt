@@ -1,0 +1,3 @@
+# Needed to run the operator scripts (scripts/validate_run.py, scripts/cleanup.py).
+# The Lambda function ships no dependencies: it uses the boto3 bundled in the python3.12 runtime.
+boto3==1.35.54

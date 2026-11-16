@@ -1,0 +1,13 @@
+{
+  "period_start": "2026-06",
+  "period_end": "2026-09",
+  "tag_keys": ["user_cost_center", "user_project"],
+  "accounts": [],
+  "regions": ["eu-south-1"],
+  "product_codes": [],
+  "resource_id_patterns": [],
+  "line_item_types": ["Usage", "DiscountedUsage", "SavingsPlanCoveredUsage"],
+  "value_strategy": "next_seen",
+  "csv_overrides_native": false,
+  "marker_key": "user_tag_backfill"
+}

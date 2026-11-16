@@ -1,0 +1,31 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Project metadata and tool configuration. This is sample code deployed with CloudFormation, not a package
+# published to PyPI. Pinned versions live in the requirements files:
+#   requirements.txt      runtime of the operator scripts (read below as the project dependencies)
+#   requirements-dev.txt  requirements.txt + test and scan tools
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sample-cur-backfill-missing-cost-allocation-tags"
+version = "1.0.0"
+description = "Rebuild cost allocation tags missing in past months from the CUR 2.0 history and expose them to the Cloud Intelligence Dashboards through an Amazon Athena view."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT-0"
+license-files = ["LICENSE"]
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
