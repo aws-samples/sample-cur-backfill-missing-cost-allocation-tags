@@ -36,7 +36,8 @@ jobs:
           "$RUNNER_TEMP/checkov/bin/checkov" -f cloudformation/template.yaml --framework cloudformation --quiet
 
       - name: cfn_nag
-        run: docker run --rm -v "$PWD:/templates" stelligent/cfn_nag:0.8.10 /templates/cloudformation/template.yaml
+        # 0.8.9 is the latest image on Docker Hub (there is no 0.8.10 tag); pinned by digest
+        run: docker run --rm -v "$PWD:/templates" stelligent/cfn_nag@sha256:40a203945f918c57a58d57579887c64165e66416e853900f5127342f8d5c202d /templates/cloudformation/template.yaml
 
       - name: Bandit (Python SAST)
         run: bandit -q -r src scripts
