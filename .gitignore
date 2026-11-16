@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+packaged.yaml
+my-*.json
+my-*.csv
+*.log
+# Security scan output (ASH, Checkov, Bandit) and private review material
+.ash/
+ash_output/
+results_*.txt
+threat-model/
+# Local editor / agent configuration
+.idea/
+.vscode/
+.kiro/
+.DS_Store

@@ -1,0 +1,1058 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CURCostTagsBackfill (v1.0.0) - rebuilds missing cost allocation tags in a CUR 2.0 table
+  and exposes them in an Athena view for Cloud Intelligence Dashboards.
+  The CUR table and AWS billing data are never modified. Sample code, not for production use
+  without review.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Naming" }
+        Parameters: [ResourcePrefix]
+      - Label: { default: "CUR 2.0 source (read only)" }
+        Parameters: [CurDatabase, CurTable, CurBucketName, CurDataPrefix, CurKmsKeyArn, PeriodColumn, CostColumn]
+      - Label: { default: "Backfill objects" }
+        Parameters: [WorkDatabase, ArtifactsBucketName, ScheduleExpression, BytesScannedCutoffPerQuery, CostDeltaTolerance, KeepRuns]
+      - Label: { default: "Security and compliance (optional)" }
+        Parameters: [KmsKeyArn, AccessLogsBucketName, PermissionsBoundaryArn, LogRetentionInDays]
+      - Label: { default: "Integration (optional)" }
+        Parameters: [NotificationEmail, CidDatasetIds, QuickSightDataSourceRoleName]
+    ParameterLabels:
+      ResourcePrefix: { default: "Prefix for the names of the resources created by the stack" }
+      KmsKeyArn: { default: "Customer managed KMS key for the stack's data (optional)" }
+
+Mappings:
+  Solution:
+    Info:
+      Name: CURCostTagsBackfill
+      Version: v1.0.0
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: cctb
+    AllowedPattern: "^[a-z][a-z0-9-]{1,18}[a-z0-9]$"
+    ConstraintDescription: 3-20 characters, lowercase letters, digits and hyphens, starting with a letter.
+    Description: >-
+      Prefix of every named resource (bucket, IAM roles, Lambda, state machine, workgroup, rules, alarms).
+      Changing it after the first deployment replaces those resources.
+  CurDatabase:
+    Type: String
+    Default: cid_data_export
+    AllowedPattern: "^[a-z0-9_]{1,255}$"
+    Description: Glue database of the CUR 2.0 table.
+  CurTable:
+    Type: String
+    Default: cur2
+    AllowedPattern: "^[a-z0-9_]{1,255}$"
+    Description: CUR 2.0 table (must contain resource IDs and the resource_tags map).
+  CurBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.\\-]{1,61}[a-z0-9]$"
+    Description: S3 bucket where Data Exports delivers the CUR.
+  CurDataPrefix:
+    Type: String
+    Default: "cur2/"
+    AllowedPattern: "^([A-Za-z0-9!_.*'()\\-][A-Za-z0-9!_.*'()/\\-]*/)?$"
+    Description: Prefix of the CUR objects (with trailing slash). Empty means the whole bucket.
+  CurKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$"
+    Description: KMS key ARN if the CUR bucket uses SSE-KMS with a customer managed key. Empty otherwise.
+  PeriodColumn:
+    Type: String
+    Default: billing_period
+    AllowedPattern: "^[a-z0-9_]+$"
+    Description: Billing period column of the CUR table (YYYY-MM strings).
+  CostColumn:
+    Type: String
+    Default: line_item_unblended_cost
+    AllowedPattern: "^[a-z0-9_]+$"
+    Description: Cost column used by the reconciliation.
+  WorkDatabase:
+    Type: String
+    Default: cur_backfill
+    AllowedPattern: "^[a-z0-9_]{1,255}$"
+    Description: Glue database created by this stack for the mapping and the views (must not exist).
+  ArtifactsBucketName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.\\-]{1,61}[a-z0-9]$"
+    Description: >-
+      Optional name for the artifacts bucket (config, overrides, mapping, reports).
+      Empty = <ResourcePrefix>-artifacts-<account>-<region>.
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 4 * * ? *)"
+    Description: Daily run, before the CID SPICE refresh (UTC).
+  BytesScannedCutoffPerQuery:
+    Type: Number
+    Default: 107374182400
+    MinValue: 10000000
+    Description: Athena guardrail per query, in bytes (default 100 GB).
+  CostDeltaTolerance:
+    Type: String
+    Default: "0.01"
+    AllowedPattern: "^[0-9]+(\\.[0-9]+)?$"
+    Description: Maximum accepted absolute cost difference per month between the CUR and the view.
+  KeepRuns:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Mapping tables to keep (current + previous) for troubleshooting.
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$"
+    Description: >-
+      Optional customer managed KMS key (same region) for the artifacts bucket, Athena results, log groups,
+      the SNS topic and the Lambda environment. Empty = AWS managed encryption. See README for the key policy.
+  AccessLogsBucketName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.\\-]{1,61}[a-z0-9]$"
+    Description: Optional existing bucket that receives S3 server access logs of the artifacts bucket.
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:iam::[0-9]{12}:policy/.+$"
+    Description: Optional IAM permissions boundary attached to every role created by the stack.
+  LogRetentionInDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention of the Lambda and Step Functions log groups.
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscribed to alarm notifications.
+  CidDatasetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Optional QuickSight dataset IDs to refresh after a successful run (e.g. summary_view).
+  QuickSightDataSourceRoleName:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. Name of the IAM role used by the CID QuickSight data source (e.g. CidCmdQuickSightDataSourceRole).
+      The stack attaches a read-only policy so CID can read the mapping tables of the view.
+
+Conditions:
+  HasArtifactsName: !Not [!Equals [!Ref ArtifactsBucketName, ""]]
+  HasCurKms: !Not [!Equals [!Ref CurKmsKeyArn, ""]]
+  HasKms: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  HasAccessLogs: !Not [!Equals [!Ref AccessLogsBucketName, ""]]
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  HasCidDatasets: !Not [!Equals [!Join ["", !Ref CidDatasetIds], ""]]
+  HasQsRole: !Not [!Equals [!Ref QuickSightDataSourceRoleName, ""]]
+
+Resources:
+  # ── Storage ────────────────────────────────────────────────────────────────
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Server access logging is enabled when AccessLogsBucketName is set (optional, enterprise log bucket).
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: Server access logging is enabled when AccessLogsBucketName is set (optional, enterprise log bucket).
+      guard:
+        # Both branches of the Fn::If below set a valid SSEAlgorithm ("aws:kms" with KmsKeyArn, "AES256" otherwise);
+        # the static rule cannot resolve the intrinsic function.
+        SuppressedRules:
+          - S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED
+    Properties:
+      BucketName: !If
+        - HasArtifactsName
+        - !Ref ArtifactsBucketName
+        - !Sub "${ResourcePrefix}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: !If [HasKms, true, !Ref AWS::NoValue]
+            ServerSideEncryptionByDefault: !If
+              - HasKms
+              - { SSEAlgorithm: "aws:kms", KMSMasterKeyID: !Ref KmsKeyArn }
+              - { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LoggingConfiguration: !If
+        - HasAccessLogs
+        - DestinationBucketName: !Ref AccessLogsBucketName
+          LogFilePrefix: !Sub "${ResourcePrefix}-artifacts/"
+        - !Ref AWS::NoValue
+      NotificationConfiguration:
+        EventBridgeConfiguration: { EventBridgeEnabled: true }
+      LifecycleConfiguration:
+        Rules:
+          - Id: athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 30
+          - Id: old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 90 }
+          - Id: abort-mpu
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub "${ArtifactsBucket.Arn}/*"
+            Condition:
+              Bool: { "aws:SecureTransport": false }
+          - Sid: DenyOutdatedTls
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub "${ArtifactsBucket.Arn}/*"
+            Condition:
+              NumericLessThan: { "s3:TlsVersion": "1.2" }
+
+  # ── Catalog and query engine ───────────────────────────────────────────────
+  WorkDatabaseResource:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref WorkDatabase
+        Description: CURCostTagsBackfill - mapping tables and backfilled CUR views
+
+  OverridesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref WorkDatabaseResource
+      TableInput:
+        Name: overrides
+        Description: Manual overrides (overrides/*.csv in the artifacts bucket)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: csv
+          skip.header.line.count: "1"
+        StorageDescriptor:
+          Location: !Sub "s3://${ArtifactsBucket}/overrides/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            Parameters:
+              separatorChar: ","
+              quoteChar: "\""
+          Columns:
+            - { Name: account_id, Type: string }
+            - { Name: resource_id, Type: string }
+            - { Name: tag_key, Type: string }
+            - { Name: tag_value, Type: string }
+            - { Name: period_start, Type: string }
+            - { Name: period_end, Type: string }
+
+  WorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_82
+            comment: >-
+              The mapping CTAS needs its own external_location (map/ prefix), which Athena rejects in workgroups
+              that enforce the configuration. The workgroup is dedicated to this tool; result encryption is set below
+              and the bucket enforces default encryption.
+    Properties:
+      Name: !Sub "${ResourcePrefix}-wg"
+      Description: CURCostTagsBackfill queries
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: !Ref BytesScannedCutoffPerQuery
+        EngineVersion: { SelectedEngineVersion: "Athena engine version 3" }
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${ArtifactsBucket}/athena-results/"
+          EncryptionConfiguration: !If
+            - HasKms
+            - { EncryptionOption: SSE_KMS, KmsKey: !Ref KmsKeyArn }
+            - { EncryptionOption: SSE_S3 }
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  # ── Compute ────────────────────────────────────────────────────────────────
+  BuilderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Encrypted with KmsKeyArn when provided; otherwise CloudWatch Logs default encryption. No customer content is logged.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Encrypted with KmsKeyArn when provided; otherwise CloudWatch Logs default encryption.
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-builder"
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [HasKms, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: cloudwatch:PutMetricData does not support resource-level permissions; it is restricted by the cloudwatch:namespace condition.
+          - id: W28
+            reason: Explicit name built from ResourcePrefix (enterprise naming convention); includes the region to allow multi-region deployments.
+          - id: W76
+            reason: The policy complexity comes from one statement per resource (bucket prefixes, Glue tables, workgroup, log group, metric namespace); merging them would widen the permissions.
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-builder-${AWS::Region}"
+      Path: !Sub "/${ResourcePrefix}/"
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: builder
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${BuilderLogGroup.Arn}:*"
+              - Sid: ReadConfigAndResults
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${ArtifactsBucket.Arn}/config/*"
+                  - !Sub "${ArtifactsBucket.Arn}/athena-results/*"
+              - Sid: WriteReports
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArtifactsBucket.Arn}/reports/*"
+              - Sid: CleanupOldMappings
+                Effect: Allow
+                Action: s3:DeleteObject
+                Resource: !Sub "${ArtifactsBucket.Arn}/map/*"
+              - Sid: ListArtifacts
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactsBucket.Arn
+              - Sid: AthenaResults
+                Effect: Allow
+                Action: [athena:GetQueryExecution, athena:GetQueryResults]
+                Resource: !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkGroup}"
+              - Sid: GlueRead
+                Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${CurDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${CurDatabase}/${CurTable}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${WorkDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${WorkDatabase}/*"
+              - Sid: GlueDropOldRuns
+                Effect: Allow
+                Action: glue:DeleteTable
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${WorkDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${WorkDatabase}/tag_backfill_map_r*"
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": CURCostTagsBackfill }
+              - Sid: ConcurrencyGuard
+                Effect: Allow
+                Action: states:ListExecutions
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ResourcePrefix}-backfill"
+        - !If
+          - HasKms
+          - PolicyName: kms
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: [kms:Decrypt, kms:GenerateDataKey]
+                  Resource: !Ref KmsKeyArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasCidDatasets
+          - PolicyName: cid-refresh
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: quicksight:CreateIngestion
+                  # dataset/* in this account and region: Fn::Join cannot build one ARN per CidDatasetIds entry
+                  # without the AWS::LanguageExtensions transform. The Lambda calls CreateIngestion only on the IDs
+                  # in CidDatasetIds (CID_DATASET_IDS); CreateIngestion refreshes SPICE, it reads or exposes no data.
+                  Resource: !Sub "arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/*"
+          - !Ref AWS::NoValue
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  Builder:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: The function only calls AWS APIs (Athena, Glue, S3, CloudWatch, Step Functions); it needs no VPC resources.
+          - id: CKV_AWS_116
+            comment: Invoked synchronously by Step Functions, which handles retries and failures; a DLQ applies to asynchronous invocations only.
+          - id: CKV_AWS_115
+            comment: Reserved concurrency would reduce the unreserved pool of small accounts; the state machine runs one execution at a time (concurrency guard).
+          - id: CKV_AWS_173
+            comment: Environment variables hold only resource names; they are encrypted with KmsKeyArn when provided, otherwise with the AWS managed key.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: The function only calls AWS APIs; it needs no VPC resources.
+          - id: W92
+            reason: Reserved concurrency would reduce the unreserved pool of small accounts; one execution at a time by design.
+          - id: W58
+            reason: The role grants logs:CreateLogStream and logs:PutLogEvents on BuilderLogGroup, which the stack creates; logs:CreateLogGroup is not needed.
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-builder"
+      Description: Renders and evaluates the CUR tag backfill SQL
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: builder.app.handler
+      Code: ../src/
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt BuilderRole.Arn
+      KmsKeyArn: !If [HasKms, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      LoggingConfig:
+        LogGroup: !Ref BuilderLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          CUR_DATABASE: !Ref CurDatabase
+          CUR_TABLE: !Ref CurTable
+          WORK_DATABASE: !Ref WorkDatabase
+          PERIOD_COLUMN: !Ref PeriodColumn
+          COST_COLUMN: !Ref CostColumn
+          ARTIFACTS_BUCKET: !Ref ArtifactsBucket
+          CONFIG_KEY: config/backfill.json
+          METRIC_NAMESPACE: CURCostTagsBackfill
+          STACK_NAME: !Ref AWS::StackName
+          COST_TOLERANCE: !Ref CostDeltaTolerance
+          KEEP_RUNS: !Ref KeepRuns
+          CID_DATASET_IDS: !Join [",", !Ref CidDatasetIds]
+          TARGET_ACCOUNT_ID: !Ref AWS::AccountId
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  # ── Orchestration ──────────────────────────────────────────────────────────
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Encrypted with KmsKeyArn when provided; otherwise CloudWatch Logs default encryption. Execution data is not logged.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Encrypted with KmsKeyArn when provided; otherwise CloudWatch Logs default encryption.
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${ResourcePrefix}-backfill"
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [HasKms, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: The CloudWatch Logs delivery actions required by Step Functions logging do not support resource-level permissions.
+          - id: CKV_AWS_356
+            comment: The CloudWatch Logs delivery actions required by Step Functions logging do not support resource-level permissions.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: The CloudWatch Logs delivery actions required by Step Functions logging do not support resource-level permissions.
+          - id: W28
+            reason: Explicit name built from ResourcePrefix (enterprise naming convention); includes the region to allow multi-region deployments.
+          - id: W76
+            reason: The policy complexity comes from one statement per resource (Athena workgroup, Glue tables, bucket prefixes, Lambda function, log delivery); merging them would widen the permissions.
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-statemachine-${AWS::Region}"
+      Path: !Sub "/${ResourcePrefix}/"
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ResourcePrefix}-backfill" }
+      Policies:
+        - PolicyName: backfill-queries
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeBuilder
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: [!GetAtt Builder.Arn, !Sub "${Builder.Arn}:*"]
+              - Sid: Athena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                Resource: !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkGroup}"
+              - Sid: GlueReadCur
+                Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:GetPartition, glue:GetPartitions, glue:BatchGetPartition]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${CurDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${CurDatabase}/*"
+              - Sid: GlueWriteWork
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${WorkDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${WorkDatabase}/*"
+              - Sid: ReadCurObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CurBucketName}/${CurDataPrefix}*"
+              - Sid: ListCurBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CurBucketName}"
+              - Sid: ArtifactsRead
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ArtifactsBucket.Arn}/*"
+              - Sid: ArtifactsWriteMapAndResults
+                # Athena writes only the mapping tables (CTAS external_location) and the query results;
+                # config/ and overrides/ (which start a run) and reports/ (written by the Lambda) stay read only.
+                Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+                Resource:
+                  - !Sub "${ArtifactsBucket.Arn}/map/*"
+                  - !Sub "${ArtifactsBucket.Arn}/athena-results/*"
+              - Sid: ArtifactsList
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:ListBucketMultipartUploads]
+                Resource: !GetAtt ArtifactsBucket.Arn
+              - Sid: LogDelivery
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+        - !If
+          - HasCurKms
+          - PolicyName: cur-kms
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref CurKmsKeyArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasKms
+          - PolicyName: kms
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: [kms:Decrypt, kms:GenerateDataKey]
+                  Resource: !Ref KmsKeyArn
+          - !Ref AWS::NoValue
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ResourcePrefix}-backfill"
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+      DefinitionSubstitutions:
+        BuilderArn: !GetAtt Builder.Arn
+        WorkGroupName: !Ref WorkGroup
+      Definition:
+        Comment: CUR tag backfill - build mapping, reconcile on a staging view, then promote
+        StartAt: Prepare
+        States:
+          Prepare:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: "${BuilderArn}"
+              Payload:
+                action: prepare
+                stateMachineArn.$: "$$.StateMachine.Id"
+                executionArn.$: "$$.Execution.Id"
+            ResultSelector: { "r.$": "$.Payload" }
+            ResultPath: "$.prepare"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: SkipOrRun
+          SkipOrRun:
+            Type: Choice
+            Choices:
+              - Variable: "$.prepare.r.skip"
+                BooleanEquals: true
+                Next: Skipped
+            Default: BuildMap
+          Skipped:
+            Type: Succeed
+          BuildMap:
+            Type: Task
+            Resource: arn:aws:states:::athena:startQueryExecution.sync
+            Parameters:
+              QueryString.$: "$.prepare.r.sql.build_map"
+              WorkGroup: "${WorkGroupName}"
+            ResultSelector: { "id.$": "$.QueryExecution.QueryExecutionId" }
+            ResultPath: "$.discard"
+            Retry:
+              - ErrorEquals: [Athena.TooManyRequestsException, Athena.InternalServerException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: StagingView
+          StagingView:
+            Type: Task
+            Resource: arn:aws:states:::athena:startQueryExecution.sync
+            Parameters:
+              QueryString.$: "$.prepare.r.sql.staging_view"
+              WorkGroup: "${WorkGroupName}"
+            ResultSelector: { "id.$": "$.QueryExecution.QueryExecutionId" }
+            ResultPath: "$.discard"
+            Retry:
+              - ErrorEquals: [Athena.TooManyRequestsException, Athena.InternalServerException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: Reconcile
+          Reconcile:
+            Type: Task
+            Resource: arn:aws:states:::athena:startQueryExecution.sync
+            Parameters:
+              QueryString.$: "$.prepare.r.sql.reconcile"
+              WorkGroup: "${WorkGroupName}"
+            ResultSelector: { "id.$": "$.QueryExecution.QueryExecutionId" }
+            ResultPath: "$.reconcile"
+            Retry:
+              - ErrorEquals: [Athena.TooManyRequestsException, Athena.InternalServerException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: Unresolved
+          Unresolved:
+            Type: Task
+            Resource: arn:aws:states:::athena:startQueryExecution.sync
+            Parameters:
+              QueryString.$: "$.prepare.r.sql.unresolved"
+              WorkGroup: "${WorkGroupName}"
+            ResultSelector: { "id.$": "$.QueryExecution.QueryExecutionId" }
+            ResultPath: "$.unresolved"
+            Retry:
+              - ErrorEquals: [Athena.TooManyRequestsException, Athena.InternalServerException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: OverridesReport
+          OverridesReport:
+            Type: Task
+            Resource: arn:aws:states:::athena:startQueryExecution.sync
+            Parameters:
+              QueryString.$: "$.prepare.r.sql.overrides_report"
+              WorkGroup: "${WorkGroupName}"
+            ResultSelector: { "id.$": "$.QueryExecution.QueryExecutionId" }
+            ResultPath: "$.overridesReport"
+            Retry:
+              - ErrorEquals: [Athena.TooManyRequestsException, Athena.InternalServerException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: Evaluate
+          Evaluate:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: "${BuilderArn}"
+              Payload:
+                action: evaluate
+                prepare.$: "$.prepare.r"
+                reconcileQueryId.$: "$.reconcile.id"
+                unresolvedQueryId.$: "$.unresolved.id"
+                overridesReportQueryId.$: "$.overridesReport.id"
+            ResultSelector: { "r.$": "$.Payload" }
+            ResultPath: "$.evaluation"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: Gate
+          Gate:
+            Type: Choice
+            Choices:
+              - Variable: "$.evaluation.r.ok"
+                BooleanEquals: true
+                Next: PromoteMap
+            Default: ReconciliationFailed
+          ReconciliationFailed:
+            Type: Fail
+            Error: ReconciliationFailed
+            Cause: Totals of the staging view differ from the CUR. Nothing was promoted. See reports/latest-summary.json.
+          PromoteMap:
+            Type: Task
+            Resource: arn:aws:states:::athena:startQueryExecution.sync
+            Parameters:
+              QueryString.$: "$.prepare.r.sql.promote_map"
+              WorkGroup: "${WorkGroupName}"
+            ResultSelector: { "id.$": "$.QueryExecution.QueryExecutionId" }
+            ResultPath: "$.discard"
+            Retry:
+              - ErrorEquals: [Athena.TooManyRequestsException, Athena.InternalServerException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: PromoteView
+          PromoteView:
+            Type: Task
+            Resource: arn:aws:states:::athena:startQueryExecution.sync
+            Parameters:
+              QueryString.$: "$.prepare.r.sql.promote_view"
+              WorkGroup: "${WorkGroupName}"
+            ResultSelector: { "id.$": "$.QueryExecution.QueryExecutionId" }
+            ResultPath: "$.discard"
+            Retry:
+              - ErrorEquals: [Athena.TooManyRequestsException, Athena.InternalServerException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: Publish
+          Publish:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: "${BuilderArn}"
+              Payload:
+                action: publish
+                prepare.$: "$.prepare.r"
+            ResultSelector: { "r.$": "$.Payload" }
+            ResultPath: "$.publish"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            End: true
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Explicit name built from ResourcePrefix (enterprise naming convention); includes the region to allow multi-region deployments.
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-events-${AWS::Region}"
+      Path: !Sub "/${ResourcePrefix}/"
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-backfill
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref StateMachine
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-schedule"
+      Description: Daily backfill run, before the CID SPICE refresh
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - { Id: backfill, Arn: !Ref StateMachine, RoleArn: !GetAtt EventsRole.Arn }
+
+  ConfigChangedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-config-changed"
+      Description: Run when backfill.json or an override CSV changes
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created, Object Deleted]
+        detail:
+          bucket: { name: [!Ref ArtifactsBucket] }
+          object:
+            key: [{ prefix: config/ }, { prefix: overrides/ }]
+      Targets:
+        - { Id: backfill, Arn: !Ref StateMachine, RoleArn: !GetAtt EventsRole.Arn }
+
+  SchemaChangedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-schema-changed"
+      Description: Rebuild the views when the CUR table schema changes
+      State: ENABLED
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Data Catalog Table State Change]
+        detail:
+          databaseName: [!Ref CurDatabase]
+          changedTables: [!Ref CurTable]
+      Targets:
+        - { Id: backfill, Arn: !Ref StateMachine, RoleArn: !GetAtt EventsRole.Arn }
+
+  # ── Monitoring ─────────────────────────────────────────────────────────────
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: >-
+              Encrypted with KmsKeyArn when provided. CloudWatch alarms cannot publish to topics encrypted with the
+              AWS managed key, so without a customer managed key the topic is not encrypted; messages contain only
+              alarm metadata.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W47
+            reason: Encrypted with KmsKeyArn when provided; alarm metadata only otherwise.
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-alarms"
+      DisplayName: CURCostTagsBackfill alarms
+      KmsMasterKeyId: !If [HasKms, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - { Key: Application, Value: !FindInMap [Solution, Info, Name] }
+        - { Key: Version, Value: !FindInMap [Solution, Info, Version] }
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              Bool: { "aws:SecureTransport": false }
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  ExecutionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Explicit name built from ResourcePrefix (enterprise naming convention); alarm names are unique per account and region.
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-executions-failed"
+      AlarmDescription: A backfill run failed (query error or reconciliation failure). Nothing was promoted.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref StateMachine }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ReconciliationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Explicit name built from ResourcePrefix (enterprise naming convention); alarm names are unique per account and region.
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-reconciliation"
+      AlarmDescription: The staging view totals differ from the CUR totals.
+      Namespace: CURCostTagsBackfill
+      MetricName: ReconciliationOk
+      Dimensions: [{ Name: Stack, Value: !Ref AWS::StackName }]
+      Statistic: Minimum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ── Optional: let the CID QuickSight data source read the mapping ─────────
+  QuickSightReadPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasQsRole
+    Properties:
+      PolicyName: !Sub "${ResourcePrefix}-cid-read"
+      Roles: [!Ref QuickSightDataSourceRoleName]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadMappingObjects
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "${ArtifactsBucket.Arn}/map/*"
+          - Sid: ListMappingPrefix
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt ArtifactsBucket.Arn
+            Condition:
+              StringLike: { "s3:prefix": ["map/*", "map"] }
+          - Sid: BucketLocation
+            Effect: Allow
+            Action: s3:GetBucketLocation
+            Resource: !GetAtt ArtifactsBucket.Arn
+          - Sid: GlueReadWork
+            Effect: Allow
+            Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:GetPartition, glue:GetPartitions]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${WorkDatabase}"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${WorkDatabase}/*"
+          - !If
+            - HasKms
+            - Sid: DecryptMapping
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Ref KmsKeyArn
+            - !Ref AWS::NoValue
+
+Outputs:
+  Version:
+    Value: !FindInMap [Solution, Info, Version]
+  ArtifactsBucket:
+    Value: !Ref ArtifactsBucket
+  ConfigUri:
+    Description: Upload backfill.json here to start a run
+    Value: !Sub "s3://${ArtifactsBucket}/config/backfill.json"
+  OverridesUri:
+    Value: !Sub "s3://${ArtifactsBucket}/overrides/"
+  ReportsUri:
+    Value: !Sub "s3://${ArtifactsBucket}/reports/"
+  StateMachineArn:
+    Value: !Ref StateMachine
+  BuilderFunctionName:
+    Value: !Ref Builder
+  AthenaWorkGroup:
+    Value: !Ref WorkGroup
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  BackfilledView:
+    Description: Point CID to this view (cid-cmd), once
+    Value: !Sub "${WorkDatabase}.cur2_backfilled"

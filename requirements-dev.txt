@@ -1,0 +1,7 @@
+# Development, tests and security scans (local and CI). Includes the runtime requirements of the scripts.
+-r requirements.txt
+pytest==9.0.3
+sqlglot==25.24.5
+cfn-lint==1.18.1
+bandit==1.9.4
+pip-audit==2.7.3

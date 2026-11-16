@@ -1,0 +1,49 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Unit tests and SQL parsing
+        run: pytest -q
+
+      - name: cfn-lint
+        run: cfn-lint cloudformation/template.yaml --ignore-checks W3002
+
+      - name: Checkov (CloudFormation)
+        # Checkov pins its own boto3: keep it in a separate virtual environment
+        run: |
+          python -m venv "$RUNNER_TEMP/checkov"
+          "$RUNNER_TEMP/checkov/bin/pip" install -q "checkov==3.3.30"
+          "$RUNNER_TEMP/checkov/bin/checkov" -f cloudformation/template.yaml --framework cloudformation --quiet
+
+      - name: cfn_nag
+        # 0.8.9 is the latest image on Docker Hub (there is no 0.8.10 tag); pinned by digest
+        run: docker run --rm -v "$PWD:/templates" stelligent/cfn_nag@sha256:40a203945f918c57a58d57579887c64165e66416e853900f5127342f8d5c202d /templates/cloudformation/template.yaml
+
+      - name: Bandit (Python SAST)
+        run: bandit -q -r src scripts
+
+      - name: pip-audit (runtime and dev dependencies)
+        run: pip-audit -r requirements.txt -r requirements-dev.txt
+
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh
